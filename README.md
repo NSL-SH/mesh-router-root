@@ -207,6 +207,12 @@ git submodule update --init --recursive
 
 Refer to each component's README for specific setup instructions.
 
+> **Submodule pointers here are bookmarks, not releases.** This repository only lists the projects
+> to clone; a submodule pointer that lags its repository's `main` (or a tag) is expected and harmless.
+> Nothing ships from these pointers: each component is released from its own repository, so after
+> committing in a submodule there is no need to bump it here. `git submodule update --remote` brings
+> every checkout to its upstream tip.
+
 ---
 
 ## Local Development
