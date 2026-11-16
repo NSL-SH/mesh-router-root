@@ -5,42 +5,37 @@ This document describes the overall architecture of the Mesh Router system.
 ## Request Flow
 
 ```
-                                                External Request
-                                                      │
-                                                      ▼
-                                            ┌─────────────────┐
-                                            │   Cloudflare    │
-                                            │  (DNS + CDN)    │
-                                            └────────┬────────┘
-                                                     │
-                                                     ▼
-                                            ┌─────────────────┐
-                                            │  CF Worker      │
-                                            │  (Edge Routing) │
-                                            └────────┬────────┘
-                                                     │
-                         ┌───────────────────────────┴───────────────────────────┐
-                         │                                                       │
-                         ▼                                                       ▼
-              ┌──────────────────────┐                             ┌──────────────────────┐
-              │  Domain Routes       │                             │  Gateway Fallback    │
-              │  (ip.<zone>, sslip)  │                             │  (OpenResty)         │
-              │  priority 1          │                             │                      │
-              └──────────┬───────────┘                             └──────────┬───────────┘
-                         │                                                    │
-                         │                                         ┌──────────┴──────────┐
-                         │                                         │ Agent + Tunnel      │
-                         │                                         │  (priority 1, 10)   │
-                         │                                         └──────────┬──────────┘
-                         │                                                    │
-                         └────────────────────────┬───────────────────────────┘
-                                                  │
-                                                  ▼
-                                      ┌──────────────────────┐
-                                      │    User's PCS        │
-                                      │  (Caddy → Services)  │
-                                      └──────────────────────┘
+                         External Request
+                                │
+                                ▼
+                     ┌──────────────────────┐
+                     │  Our nameservers     │  dash name → gateways
+                     │  (PowerDNS, nsp1/2)  │  dot name of a live user → the box
+                     └──────────┬───────────┘
+                                │
+                                ▼
+                     ┌──────────────────────┐
+                     │  mesh-router-gateway │  ZeroSSL *.<zone>, resolve,
+                     │  (OpenResty, 1..n)   │  handoff between gateways
+                     └──────────┬───────────┘
+                                │
+              ┌─────────────────┴─────────────────┐
+              ▼                                   ▼
+   ┌──────────────────────┐            ┌──────────────────────┐
+   │  Agent route         │            │  Tunnel route        │
+   │  (direct, prio 1)    │            │  (WireGuard, prio 2) │
+   └──────────┬───────────┘            └──────────┬───────────┘
+              └─────────────────┬─────────────────┘
+                                ▼
+                     ┌──────────────────────┐
+                     │    User's PCS        │
+                     │  (Caddy → Services)  │
+                     └──────────────────────┘
 ```
+
+The Cloudflare Worker (`mesh-router-gateway-cf`, edge routing with a gateway fallback) that
+used to sit in front was retired on staging 2026-11-09 and on prod 2026-11-16, after the zones'
+NS moved to our nameservers (2026-11-09 / 2026-11-14).
 
 ## Route Types
 
@@ -48,7 +43,7 @@ Routes are categorized by type and selected by priority (lower number = higher p
 
 | Type | Priority | Source | Example | Used By |
 |------|----------|--------|---------|---------|
-| `domain` | 1 | agent | `88-187-147-189.ip.nsl.sh` (ip `88.187.147.189`), https + http | CF Worker, Gateway (OpenResty) |
+| `domain` | 1 | agent | `88-187-147-189.ip.nsl.sh` (ip `88.187.147.189`), https + http | Gateway (OpenResty) |
 | `ip` | 2 | tunnel | `172.30.0.3:80` (the tunnel server) | Gateway (via WireGuard) |
 
 The agent's domain is `<ip-dashed>.<IP_ZONE>` when the box has `IP_ZONE` (agent 1.1.3+,
@@ -56,16 +51,16 @@ our nameserver), otherwise `<ip-dashed>.nip.io`.
 
 ### Why IP-encoded names?
 
-- **CF Workers cannot fetch IP addresses directly** (Cloudflare error 1003): the Worker
-  fetches `<app>-<ip>.<IP_ZONE>`, built from the route's `ip`, and falls back to
-  `<app>-<ip>.sslip.io` (the box's Let's Encrypt names)
-- **The OpenResty gateway** connects to the route's `ip` and uses `domain` as SNI
+- **Historical reason:** Cloudflare Workers cannot fetch IP addresses directly (error 1003),
+  so the Worker fetched `<app>-<ip>.<IP_ZONE>`. The Worker is retired (2026-11-16); the
+  `ip.<zone>` names stay, as the agent route domain.
+- **The OpenResty gateway** connects to the route's `ip`, SNI the box's hop name
+  `<label>.box.<zone>`
 
 ### Route Selection by Component
 
 | Component | Route Types Used | Selection Logic |
 |-----------|------------------|-----------------|
-| **CF Worker** | agent `domain` routes | Direct to the box by its IP name; gateway fallback otherwise |
 | **OpenResty Gateway** | all | Pick lowest priority healthy route (agent, then tunnel) |
 
 ## Route Registration & Validation
@@ -99,13 +94,12 @@ Agent                           Backend                         Redis
 
 | Component | Purpose | Technology |
 |-----------|---------|------------|
-| **mesh-router-gateway-cf** | Edge routing via domain routes | Cloudflare Worker |
-| **mesh-router-gateway** | Fallback proxy, IP route handling | OpenResty (Nginx + Lua) |
+| **mesh-router-gateway** | Public edge: TLS termination, resolution, proxy to the box | OpenResty (Nginx + Lua) |
 | **mesh-router-backend** | Domain/route registry, route validation | Express.js, Firebase, Redis |
 | **mesh-router-tunnel** | WireGuard VPN for NAT traversal | TypeScript, WireGuard |
 | **mesh-router-agent** | IP + domain route registration | TypeScript |
 | **mesh-dashboard** | User management UI | Next.js 14, React Admin |
-| **Cloudflare** | DNS, CDN, DDoS protection | External service |
+| **mesh-router-nameserver** | Authoritative DNS for the zones | PowerDNS |
 
 ## Data Flows
 
@@ -143,25 +137,7 @@ mesh-router-tunnel ─── POST /routes/:userid/:sig ───► mesh-router-
 
 ### Request Resolution Flow
 
-**CF Worker (primary path):**
-```
-CF Worker ─── GET /resolve/v2/:domain ───► mesh-router-backend
-    │                                              │
-    │                                              ▼
-    │                                   Redis (route lookup)
-    │                                              │
-    │◄── {routes: [{type, ip/domain, port, priority}]} ──┘
-    │
-    ├─ Filter: type=domain only
-    ├─ Sort by priority (lowest first)
-    ├─ Skip unhealthy routes
-    │
-    ▼
- Proxy to: https://{appPrefix}-{route.domain}:{port}/
- Example:  https://admin-88-187-147-189.sslip.io:443/
-```
-
-**OpenResty Gateway (fallback path):**
+**OpenResty Gateway:**
 ```
 OpenResty ─── GET /resolve/v2/:domain ───► mesh-router-backend
     │                                              │
@@ -170,7 +146,7 @@ OpenResty ─── GET /resolve/v2/:domain ───► mesh-router-backend
     │                                              │
     │◄── {routes: [{type, ip/domain, port, priority}]} ──┘
     │
-    ├─ Filter: type=ip only
+    ├─ Filter: request scheme (http/https)
     ├─ Sort by priority (lowest first)
     ├─ Check health status
     │
@@ -188,8 +164,8 @@ OpenResty ─── GET /resolve/v2/:domain ───► mesh-router-backend
 ## Security
 
 - **Authentication**: Firebase Auth for user registration, Ed25519 signatures for route registration
-- **TLS**: Let's Encrypt certificates managed by gateway/Caddy
-- **DDoS Protection**: Cloudflare in front of public endpoints
+- **TLS**: ZeroSSL `*.<zone>` on the gateways (Let's Encrypt backup); mesh-CA and Let's Encrypt certificates on the box (Caddy)
+- **DDoS Protection**: no Cloudflare in front since the NS move; several gateways behind DNS
 - **VPN**: WireGuard for encrypted tunnel traffic
 
 ## Deployment

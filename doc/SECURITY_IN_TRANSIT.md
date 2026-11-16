@@ -6,6 +6,11 @@ This document explains how data is protected as it flows through Mesh Router, in
 > `<ip-dashed>.<IP_ZONE>` (our nameserver, `*.<IP_ZONE>` in the box certificate) instead; nip.io
 > remains only on a box without `IP_ZONE`. See the note atop [DATA_FLOW.md](DATA_FLOW.md).
 
+> **No Cloudflare on the path (Worker retired 2026-11-09 staging, 2026-11-16 prod).** Our
+> nameservers answer the zones and the gateways are the edge: they terminate the client's TLS
+> with their own ZeroSSL `*.<zone>` certificate. The Cloudflare Worker, its Custom Origin Trust
+> Store (COTS) and the Cloudflare proxy hop are gone; this page is updated accordingly.
+
 ---
 
 ## Overview
@@ -17,8 +22,8 @@ Mesh Router uses a private PKI (Public Key Infrastructure) to secure communicati
 │                           ENCRYPTION LAYERS                                 │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│   Client ═══TLS═══▶ Cloudflare ═══TLS═══▶ Gateway ═══TLS═══▶ PCS           │
-│           (public)             (origin)            (mesh-ca)               │
+│   Client ═══TLS═══▶ Gateway ═══TLS═══▶ PCS                                  │
+│           (public, ZeroSSL)  (mesh-ca)                                      │
 │                                                                             │
 │   Every hop is encrypted. No plaintext transmission.                        │
 │                                                                             │
@@ -80,7 +85,7 @@ SANs included in each PCS certificate:
    └── Covers: bare domain access
 
 3. {public-ip}.nip.io           (e.g., 203.0.113.5.nip.io)
-   └── Required for CF Worker direct connections
+   └── Was required for the (retired) CF Worker's direct connections
    └── IPv6: 2001-bc8-3021--1.nip.io (colons → hyphens)
 ```
 
@@ -161,34 +166,32 @@ Renewal is seamless - no downtime during certificate rotation.
 ### Connection Map
 
 ```
-┌───────────────────────────────────────────────────────────────────────────────────────┐
-│                                                                                       │
-│    CLIENT                     CLOUDFLARE                  GATEWAY                 PCS │
-│       │                           │                          │                     │  │
-│       │◄════════ TLS 1.3 ════════▶│                          │                     │  │
-│       │   Cloudflare Edge Cert    │                          │                     │  │
-│       │   (managed by CF)         │                          │                     │  │
-│       │                           │                          │                     │  │
-│       │                           │◄════════ TLS 1.2+ ══════▶│                     │  │
-│       │                           │   Cloudflare Origin Cert │                     │  │
-│       │                           │   (Full Strict mode)     │                     │  │
-│       │                           │                          │                     │  │
-│       │                           │                          │◄═══ TLS 1.2+ ══════▶│  │
-│       │                           │                          │   mesh-router CA    │  │
-│       │                           │                          │   signed cert       │  │
-│       │                           │                          │                     │  │
-└───────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│    CLIENT                     GATEWAY                     PCS    │
+│       │                          │                         │     │
+│       │◄════════ TLS 1.2+ ══════▶│                         │     │
+│       │   ZeroSSL *.<zone>       │                         │     │
+│       │   (gateway's own cert)   │                         │     │
+│       │                          │                         │     │
+│       │                          │◄═══ TLS 1.2+ ══════════▶│     │
+│       │                          │   mesh-router CA        │     │
+│       │                          │   signed cert           │     │
+│       │                          │                         │     │
+└──────────────────────────────────────────────────────────────────┘
 ```
+
+Before the NS move (staging 2026-11-09, prod 2026-11-14) Cloudflare sat between client and
+gateway, and until 2026-11-16 a Cloudflare Worker could also fetch the PCS directly.
 
 ### Connection Details
 
 | Connection | Protocol | Certificate | Verified By | Notes |
 |------------|----------|-------------|-------------|-------|
-| **Client → Cloudflare** | TLS 1.3 | Cloudflare Edge | Browser CA store | Universal SSL, automatic |
-| **Cloudflare → Gateway** | TLS 1.2+ | Let's Encrypt | Cloudflare | Origin server cert |
+| **Client → Gateway** | TLS 1.2+ | ZeroSSL `*.<zone>` (Let's Encrypt backup) | Browser CA store | Gateway's own public cert, DNS-01 via our nameservers |
 | **Gateway → Backend API** | HTTPS | mesh-ca signed | Gateway (Lua) | Route resolution |
 | **Gateway → PCS** | TLS 1.2+ | mesh-ca signed | Gateway (nginx) | Proxied traffic |
-| **CF Worker → PCS** | TLS 1.2+ | mesh-ca signed | COTS | Requires custom trust |
+| **Gateway → Gateway** (handoff) | TLS 1.2+ | mesh-ca signed gateway cert | Gateway (nginx) | `<ip-dashed>.gw.<zone>` |
 | **Tunnel (WireGuard)** | WireGuard | Ed25519 keys | Peer public key | Encrypted tunnel |
 
 ---
@@ -218,34 +221,6 @@ server {
         proxy_pass $backend;  # https://[pcs-ip]:port
     }
 }
-```
-
-### Cloudflare Worker Trust (COTS)
-
-CF Workers only trust public CAs by default. To trust mesh-router CA:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│            CUSTOM ORIGIN TRUST STORE (COTS)                 │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  1. Obtain mesh-router CA certificate                       │
-│     GET https://backend.example.com/ca-cert                 │
-│                                                             │
-│  2. Upload to Cloudflare Dashboard                          │
-│     SSL/TLS → Custom Origin Trust Store → Upload            │
-│                                                             │
-│  3. Enable compatibility flag in wrangler.toml              │
-│     compatibility_flags = [                                 │
-│       "nodejs_compat",                                      │
-│       "cots_on_external_fetch"                              │
-│     ]                                                       │
-│                                                             │
-│  4. Worker fetch() now trusts mesh-router CA                │
-│                                                             │
-│  Cost: $10/month (Advanced Certificate Manager add-on)      │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
 ```
 
 ### PCS Trust (Caddy)
@@ -346,11 +321,10 @@ Tunnel connections use WireGuard's built-in authentication:
 | Threat | Protection | Notes |
 |--------|------------|-------|
 | **Eavesdropping** | TLS encryption on all hops | No plaintext data in transit |
-| **MITM (public internet)** | Cloudflare + browser CA verification | Standard web PKI |
+| **MITM (public internet)** | Browser CA verification of the gateway cert | Standard web PKI |
 | **MITM (gateway → PCS)** | mesh-router CA verification | Private PKI |
 | **Route hijacking** | Ed25519 signature verification | Cryptographic proof of ownership |
 | **Replay attacks** | Signature over unique userid | Cannot replay old registrations |
-| **DDoS** | Cloudflare protection | Included with CF |
 
 ### Known Limitations
 
@@ -358,14 +332,13 @@ Tunnel connections use WireGuard's built-in authentication:
 |------------|--------|------------|
 | **72h certificate validity** | Requires regular renewal | Automatic renewal by agent |
 | **Single CA** | CA compromise affects all PCS | Monitor CA, rotate if needed |
-| **COTS cost** | $10/month for CF Worker mode | Use gateway-only mode if cost-sensitive |
-| **nip.io dependency** | CF Worker requires nip.io | Fallback to gateway if nip.io fails |
+| **No Cloudflare DDoS shield** | The gateways are the public edge since the NS move | Several gateways behind DNS |
 
 ### Security Best Practices
 
 1. **Protect the CA private key** - The mesh-router-backend CA key should be secured
 2. **Use short certificate validity** - 72h limits exposure from compromised certs
-3. **Enable Cloudflare Full (Strict)** - Verify origin certificates
+3. **Verify origin certificates** - The gateway checks every PCS cert against the mesh-router CA
 4. **Monitor certificate expiry** - Alert if renewal fails
 5. **Rotate Ed25519 keys** - Consider periodic key rotation for agents
 
@@ -384,11 +357,6 @@ Tunnel connections use WireGuard's built-in authentication:
 │  • Check /etc/ssl/certs/mesh-ca.pem exists                  │
 │  • Verify nginx config: proxy_ssl_trusted_certificate       │
 │  • Ensure PCS cert signed by current CA (not old CA)        │
-│                                                             │
-│  CF Worker → PCS:                                           │
-│  • Verify COTS is configured in Cloudflare dashboard        │
-│  • Check cots_on_external_fetch flag in wrangler.toml       │
-│  • Ensure PCS cert has nip.io SAN                           │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 
@@ -419,7 +387,6 @@ Tunnel connections use WireGuard's built-in authentication:
 
 ## Related Documentation
 
-- [Gateway Modes](./GATEWAY_MODES.md) - Comparison of gateway configurations
+- [Gateway Modes](./GATEWAY_MODES.md) - The gateway layer (CF Worker modes retired)
 - [Data Flow](./DATA_FLOW.md) - Request flow diagrams
-- [COTS Setup Guide](../mesh-router-gateway-cf/docs/CLOUDFLARE_COTS.md) - Cloudflare trust store configuration
 - [mesh-router-backend API](../mesh-router-backend/readme.md) - Certificate endpoints

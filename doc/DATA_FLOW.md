@@ -1,13 +1,20 @@
 # Data Flow
 
-This document provides detailed diagrams showing how data flows through each gateway mode in Mesh Router.
+This document provides detailed diagrams showing how data flows through the gateway in Mesh Router.
+
+> **Cloudflare Worker retired (staging 2026-11-09, prod 2026-11-16).** The OpenResty gateway
+> is the only gateway mode. Our nameservers answer every name: dash names resolve to the
+> gateways, which terminate TLS with their own ZeroSSL `*.<zone>` and proxy to the box direct
+> (agent) or through the WireGuard tunnel; dot names of a live user zone resolve straight to the
+> box. The diagram below still shows Cloudflare in front of the gateway and its latencies were
+> measured that way: both are historical. The former "Mode 2: Cloudflare Worker" and "Mode 3:
+> CF Worker + Fallback" flows were removed with the Worker.
 
 > **Route model changed (2026-10-23).** The diagrams below show the older six-route
 > model (raw `ip`, sslip.io and nip.io agent routes). Today the agent registers one
 > domain route per scheme: `<ip-dashed>.<IP_ZONE>` (agent 1.1.3+, our nameserver), or
-> `<ip-dashed>.nip.io` on a box without `IP_ZONE`. The CF Worker fetches
-> `<app>-<ip>.<IP_ZONE>` and falls back to `<app>-<ip>.sslip.io`; the gateway connects by
-> the route's `ip` with `domain` as SNI. Current table: [architecture/README.md](architecture/README.md#route-types).
+> `<ip-dashed>.nip.io` on a box without `IP_ZONE`. The gateway connects by the route's `ip`
+> (SNI: the box's hop name `<label>.box.<zone>`). Current table: [architecture/README.md](architecture/README.md#route-types).
 
 ---
 
@@ -20,7 +27,7 @@ Client Request
       │
       ▼
 ┌─────────────┐
-│  DNS        │  Resolves *.user.domain to gateway/CF
+│  DNS        │  Resolves dash names to the gateways
 │  Resolution │
 └──────┬──────┘
        │
@@ -157,236 +164,13 @@ Total latency: ~283ms (p50)
 
 ---
 
-## Mode 2: Cloudflare Worker Flow
+## Retired: Cloudflare Worker Flows
 
-### Complete Request Lifecycle
-
-```
- CLIENT                    CLOUDFLARE EDGE           CF WORKER                            BACKEND API                PCS
-    │                          │                          │                                  │                      │
-    │  1. HTTPS Request        │                          │                                  │                      │
-    │  app.alice.nsl.sh/api    │                          │                                  │                      │
-    │─────────────────────────▶│                          │                                  │                      │
-    │                          │                          │                                  │                      │
-    │                          │  2. Route to Worker      │                                  │                      │
-    │                          │─────────────────────────▶│                                  │                      │
-    │                          │  (edge, <10ms)           │                                  │                      │
-    │                          │                          │                                  │                      │
-    │                          │                          │  3. Extract subdomain            │                      │
-    │                          │                          │     "alice" from Host header     │                      │
-    │                          │                          │     appPrefix = "app"            │                      │
-    │                          │                          │                                  │                      │
-    │                          │                          │  4. Query resolve API            │                      │
-    │                          │                          │─────────────────────────────────▶│                      │
-    │                          │                          │  GET /resolve/v2/alice           │                      │
-    │                          │                          │  (cached 60s at CF edge)         │                      │
-    │                          │                          │                                  │                      │
-    │                          │                          │  5. Return routes (pre-validated)│                      │
-    │                          │                          │◀─────────────────────────────────│                      │
-    │                          │                          │  {routes: [                      │                      │
-    │                          │                          │    {type:"domain",               │                      │
-    │                          │                          │     domain:"88-x.sslip.io",      │                      │
-    │                          │                          │     priority:2},                 │                      │
-    │                          │                          │    {type:"domain",               │                      │
-    │                          │                          │     domain:"88-x.nip.io",        │                      │
-    │                          │                          │     priority:3}                  │                      │
-    │                          │                          │  ]}                              │                      │
-    │                          │                          │                                  │                      │
-    │                          │                          │  6. Filter type=domain           │                      │
-    │                          │                          │     Select lowest priority       │                      │
-    │                          │                          │     Prepend appPrefix            │                      │
-    │                          │                          │                                  │                      │
-    │                          │                          │  7. fetch() with CF pooling      │                      │
-    │                          │                          │─────────────────────────────────────────────────────────▶│
-    │                          │                          │  https://app-88-x.sslip.io:443   │                      │
-    │                          │                          │  (domain from route, no IP→DNS)  │                      │
-    │                          │                          │                                  │                      │
-    │                          │                          │  8. Response from app            │                      │
-    │                          │                          │◀─────────────────────────────────────────────────────────│
-    │                          │                          │                                  │                      │
-    │                          │  9. Return response      │                                  │                      │
-    │                          │◀─────────────────────────│                                  │                      │
-    │                          │                          │                                  │                      │
-    │  10. Response            │                          │                                  │                      │
-    │◀─────────────────────────│                          │                                  │                      │
-    │                          │                          │                                  │                      │
-
-Total latency: ~169ms (p50)
-├── Client → CF Edge: ~30ms
-├── Worker execution: <10ms
-├── Resolve API (cached): <5ms
-├── CF → PCS (with pooling): ~100ms  ◀── Faster due to connection reuse
-├── PCS processing: ~30ms
-└── Return path: minimal (same connection)
-```
-
-### Domain Route Selection
-
-```
-Routes are pre-registered and pre-validated by the agent.
-CF Worker filters and uses domain routes directly.
-
-┌─────────────────────────────────────────────────────────────┐
-│                  DOMAIN ROUTE SELECTION                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  Routes from API (already validated at registration):       │
-│  [                                                          │
-│    {type:"ip", ip:"88.187.147.189", priority:1},  ◀─ Skip  │
-│    {type:"domain", domain:"88-187-147-189.sslip.io", p:2}, │
-│    {type:"domain", domain:"88-187-147-189.nip.io", p:3}    │
-│  ]                                                          │
-│                                                             │
-│  Worker processing:                                         │
-│  1. Filter: type="domain" only                              │
-│     → ["88-187-147-189.sslip.io", "88-187-147-189.nip.io"]  │
-│                                                             │
-│  2. Sort by priority (lowest first)                         │
-│     → sslip.io (priority 2) selected                        │
-│                                                             │
-│  3. Skip if marked unhealthy (from previous failures)       │
-│                                                             │
-│  4. Prepend app prefix from request                         │
-│     Request: app.alice.nsl.sh                               │
-│     → appPrefix = "app"                                     │
-│     → "app-88-187-147-189.sslip.io"                         │
-│                                                             │
-│  5. Build URL and fetch                                     │
-│     → https://app-88-187-147-189.sslip.io:443/path          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-
-Key change: Domain is pre-registered, not constructed from IP.
-If sslip.io was unreachable at registration, it won't be in the list.
-```
-
-### DNS Services for Domain Routes
-
-```
-CF Workers cannot fetch() to raw IP addresses.
-Solution: Use wildcard DNS services that embed the IP in the hostname.
-
-┌─────────────────────────────────────────────────────────────┐
-│                    DNS SERVICE OPTIONS                      │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  sslip.io (preferred, priority 2):                          │
-│    88.187.147.189     → 88-187-147-189.sslip.io            │
-│    2001:bc8:3021::1   → 2001-bc8-3021--1.sslip.io          │
-│                                                             │
-│  nip.io (fallback, priority 3):                             │
-│    88.187.147.189     → 88-187-147-189.nip.io              │
-│    2001:bc8:3021::1   → 2001-bc8-3021--1.nip.io            │
-│                                                             │
-│  Why two services?                                          │
-│    • Redundancy: if one DNS service has issues, use other   │
-│    • Validated at registration: only working ones stored    │
-│    • sslip.io often faster/more reliable (hence priority 2) │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-
-PCS certificates must include SANs for these domains.
-```
-
----
-
-## Mode 3: CF Worker + Fallback Flow
-
-### Complete Request Lifecycle (with fallback)
-
-```
- CLIENT                    CF EDGE                  CF WORKER                        PCS / GATEWAY
-    │                          │                          │                                │
-    │  1. HTTPS Request        │                          │                                │
-    │─────────────────────────▶│                          │                                │
-    │                          │                          │                                │
-    │                          │  2. Route to Worker      │                                │
-    │                          │─────────────────────────▶│                                │
-    │                          │                          │                                │
-    │                          │                          │  3. Resolve domain             │
-    │                          │                          │  4. Try direct to PCS          │
-    │                          │                          │────────────────────────────────▶│ PCS
-    │                          │                          │  fetch(nip.io:10443)           │
-    │                          │                          │                                │
-    │                          │                          │         ┌────────────────────┐ │
-    │                          │                          │         │   TLS HANDSHAKE    │ │
-    │                          │                          │         │   FAILED           │ │
-    │                          │                          │         │   (COTS not set)   │ │
-    │                          │                          │         └────────────────────┘ │
-    │                          │                          │                                │
-    │                          │                          │  5. Catch error or 502         │
-    │                          │                          │     Check: server=cloudflare   │
-    │                          │                          │                                │
-    │                          │                          │  6. Fallback to Gateway        │
-    │                          │                          │────────────────────────────────▶│ GATEWAY
-    │                          │                          │  fetch(gateway.entrypoint...)  │
-    │                          │                          │                                │
-    │                          │                          │                         ┌──────┴──────┐
-    │                          │                          │                         │   Gateway   │
-    │                          │                          │                         │   resolves  │
-    │                          │                          │                         │   & proxies │
-    │                          │                          │                         └──────┬──────┘
-    │                          │                          │                                │
-    │                          │                          │                                ▼
-    │                          │                          │                         ┌───────────┐
-    │                          │                          │                         │    PCS    │
-    │                          │                          │                         └─────┬─────┘
-    │                          │                          │                               │
-    │                          │                          │  7. Response via Gateway      │
-    │                          │                          │◀───────────────────────────────│
-    │                          │                          │                                │
-    │                          │  8. Return response      │                                │
-    │                          │◀─────────────────────────│                                │
-    │                          │                          │                                │
-    │  9. Response             │                          │                                │
-    │◀─────────────────────────│                          │                                │
-    │                          │                          │                                │
-```
-
-### Fallback Decision Logic
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Fallback Decision Tree                   │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  try {                                                      │
-│    response = await fetch(nip.io URL)                       │
-│  }                                                          │
-│                           │                                 │
-│              ┌────────────┴────────────┐                    │
-│              │                         │                    │
-│          SUCCESS                    EXCEPTION               │
-│              │                         │                    │
-│              ▼                         ▼                    │
-│     Check status code           Check if CF SSL error       │
-│              │                         │                    │
-│     ┌────────┴────────┐     ┌──────────┴──────────┐        │
-│     │                 │     │                     │        │
-│   200-499           502    SSL Error          Other        │
-│     │                 │     │                     │        │
-│     ▼                 ▼     ▼                     ▼        │
-│  Return          Check        FALLBACK         Re-throw    │
-│  response       headers       to Gateway                   │
-│                    │                                       │
-│            ┌───────┴───────┐                               │
-│            │               │                               │
-│     server:cloudflare    other                             │
-│            │               │                               │
-│            ▼               ▼                               │
-│       FALLBACK        Return 502                           │
-│       to Gateway      (PCS error)                          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-
-Fallback URL format:
-  https://gateway.entrypoint.{server-domain}{path}
-
-Why "gateway.entrypoint."?
-  - Prevents routing loops
-  - CF Worker ignores requests to this subdomain
-  - Gateway handles it directly
-```
+The Cloudflare Worker (`mesh-router-gateway-cf`) fetched the box by an IP-encoded name and fell
+back to the OpenResty gateway through `gateway.entrypoint.<zone>`. Both flows ended with the
+Worker's retirement (staging 2026-11-09, prod 2026-11-16): the Worker, its `*.<zone>/*` route
+and the `gateway.entrypoint` record are deleted. IP-encoded names (`ip.<zone>`) remain, as the
+agent route domain.
 
 ---
 
@@ -401,7 +185,7 @@ Routes are categorized by `type` field and selected based on the routing compone
 │                                                             │
 │  IP ROUTES (type: "ip")                                     │
 │  ─────────────────────────────────────                      │
-│  Used by: OpenResty Gateway (can connect to IPs directly)   │
+│  Used by: Gateway (connects to IPs directly)                │
 │                                                             │
 │  ┌──────────┬──────────┬────────────────────────────────┐   │
 │  │ Priority │ Source   │ Example                        │   │
@@ -414,7 +198,7 @@ Routes are categorized by `type` field and selected based on the routing compone
 │                                                             │
 │  DOMAIN ROUTES (type: "domain")                             │
 │  ─────────────────────────────────────                      │
-│  Used by: CF Worker (cannot connect to IPs, uses DNS)       │
+│  Used by: the retired CF Worker (could not connect to IPs)  │
 │                                                             │
 │  ┌──────────┬──────────┬────────────────────────────────┐   │
 │  │ Priority │ Source   │ Example                        │   │
@@ -429,8 +213,7 @@ Routes are categorized by `type` field and selected based on the routing compone
 └─────────────────────────────────────────────────────────────┘
 
 Route selection: Lower priority number wins.
-CF Worker uses domain routes, Gateway uses IP routes.
-If all domain routes fail, CF Worker falls back to Gateway.
+The gateway connects by `ip` for every route; the domain was for the retired CF Worker.
 ```
 
 ## Route Registration & Validation

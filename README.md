@@ -51,7 +51,6 @@ Mesh Router enables secure, distributed routing of traffic between public server
 |-----------|-------------|---------------|
 | [**mesh-router-backend**](./mesh-router-backend) | Express.js API for domain management and IP resolution | [README](./mesh-router-backend/README.md) |
 | [**mesh-router-gateway**](./mesh-router-gateway) | OpenResty reverse proxy gateway for wildcard domain routing | [README](./mesh-router-gateway/README.md) |
-| [**mesh-router-gateway-cf**](./mesh-router-gateway-cf) | Cloudflare Worker gateway for edge-based routing | [README](./mesh-router-gateway-cf/README.md) |
 | [**mesh-router-tunnel**](./mesh-router-tunnel) | WireGuard-based VPN tunneling for NAT traversal | [README](./mesh-router-tunnel/README.md) |
 | [**mesh-router-agent**](./mesh-router-agent) | Lightweight agent for direct IP registration | [README](./mesh-router-agent/README.md) |
 | [**mesh-dashboard**](./mesh-dashboard) | Web dashboard for mesh network management | [README](./mesh-dashboard/README.md) |
@@ -111,18 +110,15 @@ once), then bump the image in `mesh-router-template-root` on `main`, then `stabl
 
 ## Gateway Modes
 
-Mesh Router supports three gateway configurations:
+The OpenResty gateway (`mesh-router-gateway`) is the gateway layer: our nameservers answer
+dash names (`<app>-<user>.<zone>`) with every healthy gateway, which terminates TLS with its
+own `*.<zone>` certificate and proxies to the box directly (agent) or through the WireGuard
+tunnel. Dot names of a live user zone resolve straight to the box. The Cloudflare Worker
+gateway (`mesh-router-gateway-cf`, now archived) and its "CF Worker Only" / "CF + Fallback"
+modes were retired on staging 2026-11-09 and on prod 2026-11-16.
 
-| Mode | Description | Performance |
-|------|-------------|-------------|
-| **CF Worker Only** | Edge-based routing via Cloudflare Workers | Best (~249 req/s, 169ms p50) |
-| **OpenResty Only** | Self-hosted reverse proxy | Simpler setup (~159 req/s, 283ms p50) |
-| **CF + Fallback** | CF Worker with OpenResty fallback | Maximum reliability |
-
-For detailed guidance on choosing and configuring gateway modes:
-
-- [Gateway Modes Guide](./doc/GATEWAY_MODES.md) - Decision tree and comparison
-- [Data Flow](./doc/DATA_FLOW.md) - How traffic flows through each mode
+- [Gateway Modes Guide](./doc/GATEWAY_MODES.md) - The gateway layer, and what was retired
+- [Data Flow](./doc/DATA_FLOW.md) - How traffic flows through the gateway
 - [Security in Transit](./doc/SECURITY_IN_TRANSIT.md) - Certificates and encryption
 
 ---
@@ -139,25 +135,24 @@ Add `X-Mesh-Trace: 1` request header to see the routing path in the response:
 
 ```bash
 curl -s -D- -o /dev/null -H "X-Mesh-Trace: 1" https://app.alice.domain.com/ | grep -i x-mesh-route
-# Response: x-mesh-route: cf-worker,ip-dns,direct,pcs
+# Response: x-mesh-route: agent,pcs
 ```
 
-Route path segments:
-- `cf-worker` - Cloudflare Worker processed the request
-- `ip-dns` - Direct path to the box over its `ip.<zone>` name (~4x faster than gateway)
-- `ip-dns-fail`, `sslip.io` - That direct path failed; retried over the box's sslip.io name
-- `nip.io` - Direct path via nip.io, on a box without `IP_ZONE`
-- `gateway-fallback` - OpenResty gateway fallback
-- `direct` / `agent` - Route from mesh-router-agent
+Route path segments (set by the gateway):
+- `handoff` / `retry,handoff` - Handed to the gateway that reaches the box (no route of its own / own tunnel route failed to connect)
+- `agent` - Route from mesh-router-agent (direct)
 - `tunnel` - Route from mesh-router-tunnel (WireGuard)
+- `tunnel-routed` - Tunnel route reached at the box's WireGuard address on the gateway host
 - `pcs` - Final destination
+
+The Worker's segments (`cf-worker`, `ip-dns`, `ip-dns-fail`, `sslip.io`, `nip.io`,
+`gateway-fallback`) no longer appear since its retirement.
 
 #### X-Mesh-Force
 
 Force a specific routing path for testing:
 
 ```bash
-curl -H "X-Mesh-Force: gateway" https://app.alice.domain.com/  # Use gateway fallback
 curl -H "X-Mesh-Force: direct" https://app.alice.domain.com/   # Prefer agent routes
 curl -H "X-Mesh-Force: tunnel" https://app.alice.domain.com/   # Prefer tunnel routes
 ```
