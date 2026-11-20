@@ -12,7 +12,7 @@
 	url = https://github.com/NSL-SH/mesh-router-gateway.git
 [submodule "mesh-router-template-root"]
 	path = mesh-router-template-root
-	url = https://github.com/Yundera/mesh-router-template-root.git
+	url = https://github.com/NSL-SH/mesh-router-template-root.git
 [submodule "mesh-dashboard"]
 	path = mesh-dashboard
 	url = https://github.com/NSL-SH/mesh-dashboard.git
