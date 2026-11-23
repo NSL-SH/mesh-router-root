@@ -40,3 +40,6 @@
 [submodule "files"]
 	path = files
 	url = https://github.com/NSL-SH/files.git
+[submodule "mesh-router-guard"]
+	path = mesh-router-guard
+	url = https://github.com/NSL-SH/mesh-router-guard
