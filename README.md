@@ -69,6 +69,7 @@ Mesh Router enables secure, distributed routing of traffic between public server
 | [**mail-gateway**](./mail-gateway) | SMTP gateway: apps send mail, it relays over HTTPS | [README](./mail-gateway/README.md) |
 | [**maison**](./maison) | The dashboard and app manager (replaces CasaOS): installs store apps, backups, domains | [README](./maison/README.md), [docs](./maison/docs) |
 | [**files**](./files) | Web file manager for the box (replaces FileBrowser) | [README](./files/README.md) |
+| [**mesh-router-guard**](./mesh-router-guard) | Packet-level enforcement of CrowdSec bans: the firewall bouncer owning the `inet nsl-guard` nft table (guard stack) | [README](./mesh-router-guard/README.md) |
 
 ---
 
@@ -89,6 +90,7 @@ mesh-router-template-root        /DATA/AppData/mesh        every box
   stack auth    → /DATA/AppData/auth     dex, authelia, auth-registrar, auth-console
   stack maison  → /DATA/AppData/maison   maison (AppShield gate) + maison-app (the dashboard)
                                            └── store apps → /DATA/AppData/<app>
+  stack guard   → /DATA/AppData/guard    crowdsec + mesh-router-guard (IP bans), MESH_GUARD=on only
 ```
 
 All stacks share the external `pcs` network; requests arrive through the tunnel or
@@ -99,6 +101,7 @@ agent, and caddy routes each hostname by container labels.
 | What | Pinned in | Reaches a box |
 |---|---|---|
 | The maison image | `mesh-router-template-root/stacks/maison/docker-compose.yml` (`ghcr.io/yundera/maison:<x.y.z>`) | next self-check after the template change lands on the box's channel |
+| The guard images (crowdsec, mesh-router-guard) | `mesh-router-template-root/stacks/guard/docker-compose.yml` | same, on boxes with `MESH_GUARD=on` |
 | The mesh template | the update channel: `MESH_UPDATE_CHANNEL` (`stable` / `main`); on a managed PCS, `template-root` picks the branch (or `MESH_REF`) | nightly self-check |
 | Store apps | the app stores; each app updates from Maison's per-app Update | when the user (or Settings › Updates) applies it |
 
